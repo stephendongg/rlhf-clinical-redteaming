@@ -7,43 +7,28 @@ Multi-turn adversarial stress-testing for clinical LLMs, comparing PPO and DPO f
 
 ---
 
-## Local Setup (VS Code)
+## Setup
 
-```bash
-# 1. Create and activate a virtual environment
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+**Requires a Colab A100 GPU.**
 
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Set your API key
-cp .env.example .env
-# then open .env and paste your OPENAI_API_KEY
-```
-
-Then open `redteam.ipynb` in VS Code. Click the **kernel picker** (top-right of the notebook) → **Python Environments** → select `.venv`.
-
----
-
-## Google Colab Setup
-
-Clone the repo into Google Drive once, then open `redteam.ipynb` from Drive in Colab:
-
+1. Clone the repo into Google Drive (run once):
 ```python
 from google.colab import drive
 drive.mount('/content/drive')
-!git clone https://github.com/stephendongg/rlhf-clinical-redteam /content/drive/MyDrive/rlhf-clinical-redteam
+!git clone https://github.com/stephendongg/rlhf-clinical-redteaming /content/drive/MyDrive/rlhf-clinical-redteaming
 ```
 
-Each subsequent session just run `!git pull` to get the latest code.
+2. Add your OpenAI key to Colab Secrets (🔑 icon, left sidebar): `OPENAI_API_KEY`
+
+3. Open `redteam.ipynb` from Drive in Colab and run all cells.
+
+Each subsequent session: open the notebook from Drive and run `!git pull` to get the latest code.
 
 ---
 
 ## Dataset
 
-**Med-Safety-Bench** (Han et al., NeurIPS 2024)  
-1,800 harmful medical requests paired with safe responses.
+**Med-Safety-Bench** (Han et al., NeurIPS 2024) — 1,800 harmful medical requests paired with safe responses.
 
 - Loaded via HuggingFace: `israel-adewuyi/med-safety-bench-reproduced`
 - Train split (900): used for PPO/DPO fine-tuning
@@ -55,6 +40,6 @@ Each subsequent session just run `!git pull` to get the latest code.
 
 | Role | Model |
 |---|---|
-| Target (defender) | `BioMistral-7B` |
-| Attacker (adversary) | `Qwen2.5-7B` |
+| Attacker | `Qwen/Qwen2.5-7B-Instruct` |
+| Target | `BioMistral/BioMistral-7B` |
 | Judge | `GPT-4o` via OpenAI API |

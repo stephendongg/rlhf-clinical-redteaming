@@ -55,6 +55,8 @@ def make_attacker(
     temperature: float = 0.7,
 ) -> AttackerFn:
     system = ATTACKER_SYSTEM_PROMPT.format(seed_scenario=seed_scenario)
+    # PeftModel does not expose a top-level .device attribute, so resolve via params.
+    device = next(attacker_model.parameters()).device
 
     def attacker(history: list[dict]) -> tuple[str, list[dict], list[int]]:
         messages = [{"role": "system", "content": system}]
@@ -67,7 +69,7 @@ def make_attacker(
         text = attacker_tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
-        inputs = attacker_tokenizer(text, return_tensors="pt").to(attacker_model.device)
+        inputs = attacker_tokenizer(text, return_tensors="pt").to(device)
 
         with torch.no_grad():
             output = attacker_model.generate(
@@ -91,6 +93,8 @@ def make_target(
     max_new_tokens: int = 256,
     temperature: float = 0.7,
 ) -> TargetFn:
+    device = next(target_model.parameters()).device
+
     def target(history: list[dict]) -> str:
         text = TARGET_SYSTEM_PROMPT + "\n\n"
         for m in history:
@@ -100,7 +104,7 @@ def make_target(
                 text += f"Assistant: {m['content']}\n"
         text += "Assistant:"
 
-        inputs = target_tokenizer(text, return_tensors="pt").to(target_model.device)
+        inputs = target_tokenizer(text, return_tensors="pt").to(device)
 
         with torch.no_grad():
             output = target_model.generate(

@@ -1,5 +1,6 @@
 """Preference pair construction from a batch of trajectories."""
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable
 
@@ -29,6 +30,28 @@ def build_pairs(
         trajectory with the lowest. Skip seeds where all trajectories tie.
 
     Reference log-probs are cached at construction so the inner training
-    loop does not re-forward π_ref on every gradient step.
+    loop does not re-forward π_ref on every gradient step. The caller
+    supplies `ref_logprob_fn` as a closure that already wraps the model in
+    a `disable_adapter()` context (see Cell 5.4 for the standard pattern).
     """
-    raise NotImplementedError
+    if strategy != "best_vs_worst":
+        raise ValueError(f"unknown strategy: {strategy!r}")
+
+    by_seed: dict[str, list[Trajectory]] = defaultdict(list)
+    for t in trajectories:
+        by_seed[t.seed_scenario].append(t)
+
+    pairs: list[PreferencePair] = []
+    for seed, trajs in by_seed.items():
+        if len(trajs) < 2:
+            continue
+        srt = sorted(trajs, key=lambda t: t.effectiveness)
+        chosen, rejected = srt[-1], srt[0]
+        if chosen.effectiveness == rejected.effectiveness:
+            continue
+        pair = PreferencePair(seed=seed, chosen=chosen, rejected=rejected)
+        pair.chosen_ref_logp = float(ref_logprob_fn(chosen).item())
+        pair.rejected_ref_logp = float(ref_logprob_fn(rejected).item())
+        pairs.append(pair)
+
+    return pairs

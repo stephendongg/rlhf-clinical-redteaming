@@ -1,6 +1,7 @@
 """Trajectory-level multi-turn DPO loss and outer iterative training loop."""
 
 import os
+import pickle
 import random
 from typing import Any, Callable
 
@@ -100,6 +101,15 @@ def iterative_dpo_train(
 
         n_succ = sum(1 for t in trajectories if t.attack_success)
         print(f"  collected {len(trajectories)} trajectories, {n_succ} successful")
+
+        # Persist trajectories before training so analysis survives even if
+        # the rest of the iteration crashes (or no pairs end up being built).
+        if checkpoint_dir is not None:
+            iter_dir = os.path.join(checkpoint_dir, f"iter_{outer:03d}")
+            os.makedirs(iter_dir, exist_ok=True)
+            with open(os.path.join(iter_dir, "trajectories.pkl"), "wb") as f:
+                pickle.dump(trajectories, f)
+            print(f"  saved trajectories to {iter_dir}/trajectories.pkl")
 
         # --- 2. Build preference pairs (caches ref log-probs) ---
         with torch.no_grad():

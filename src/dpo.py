@@ -1,5 +1,6 @@
 """Trajectory-level multi-turn DPO loss and outer iterative training loop."""
 
+import json
 import os
 import pickle
 import random
@@ -179,5 +180,10 @@ def iterative_dpo_train(
             "train_mean_rejected_logr": sum(step_metrics["rejected_logr"]) / len(step_metrics["rejected_logr"]),
             **{f"eval_{k}": v for k, v in eval_metrics.items() if k != "trajectories"},
         })
+
+        # Persist history each iter so a Colab disconnect doesn't lose metrics.
+        if checkpoint_dir is not None:
+            with open(os.path.join(checkpoint_dir, "history.json"), "w") as f:
+                json.dump(history, f, indent=2, default=str)
 
     return history

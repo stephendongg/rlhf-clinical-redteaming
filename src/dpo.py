@@ -131,14 +131,14 @@ def iterative_dpo_train(
 
         for epoch in range(n_epochs):
             random.shuffle(pairs)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             for i, pair in enumerate(pairs):
                 loss, m = dpo_loss(policy, tokenizer, pair, beta=beta)
                 (loss / grad_accum).backward()
 
                 if (i + 1) % grad_accum == 0 or (i + 1) == len(pairs):
                     optimizer.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
 
                 for k, v in m.items():
                     step_metrics[k].append(v)

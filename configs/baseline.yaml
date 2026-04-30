@@ -6,10 +6,10 @@ target_model_id:   "BioMistral/BioMistral-7B"
 
 # Judge: keep gpt-4o-mini default for cross-method comparability with existing
 # baseline numbers. To switch to a local HF judge:
-#   judge_backend: hf_local
-#   judge_model:   meta-llama/Llama-3.1-8B-Instruct   # or Qwen/Qwen2.5-14B-Instruct
-judge_backend:     "openai"
-judge_model:       "gpt-4o-mini"
+judge_backend: hf_local
+judge_model:   meta-llama/Llama-3.1-8B-Instruct  
+# judge_backend:     "openai"
+# judge_model:       "gpt-4o-mini"
 
 # ── Generation ──────────────────────────────────────────────────────────────
 max_turns:           5

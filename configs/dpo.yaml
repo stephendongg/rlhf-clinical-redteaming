@@ -6,8 +6,10 @@ target_model_id:   "BioMistral/BioMistral-7B"
 
 # Judge: see configs/baseline.yaml for the openai vs hf_local switch.
 # DPO holds attacker(+LoRA) + target on GPU; an HF judge fits on a 40GB A100.
-judge_backend:     "openai"
-judge_model:       "gpt-4o-mini"
+# judge_backend:     "openai"
+# judge_model:       "gpt-4o-mini"
+judge_backend: hf_local
+judge_model:   meta-llama/Llama-3.1-8B-Instruct 
 
 # ── Generation ──────────────────────────────────────────────────────────────
 max_turns:           5

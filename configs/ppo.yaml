@@ -6,8 +6,10 @@ target_model_id:   "BioMistral/BioMistral-7B"
 
 # Judge: keep openai for PPO. PPO already holds policy + ref + target on GPU,
 # so an 8B HF judge will likely OOM on a 40GB A100. Use hf_local only on 80GB.
-judge_backend:     "openai"
-judge_model:       "gpt-4o-mini"
+# judge_backend:     "openai"
+# judge_model:       "gpt-4o-mini"
+judge_backend: hf_local
+judge_model:   meta-llama/Llama-3.1-8B-Instruct 
 
 # ── Generation ──────────────────────────────────────────────────────────────
 max_turns:           5

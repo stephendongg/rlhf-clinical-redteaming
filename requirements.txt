@@ -8,3 +8,4 @@ accelerate
 bitsandbytes
 trl
 peft
+scikit-learn

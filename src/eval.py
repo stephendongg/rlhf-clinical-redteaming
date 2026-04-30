@@ -2,6 +2,8 @@
 
 from typing import Any, Callable
 
+from tqdm.auto import tqdm
+
 from .rollouts import Trajectory, make_attacker, run_conversation
 
 
@@ -18,12 +20,16 @@ def evaluate_attacker(
     return a dict with ASR, avg_TTF_successes_only, avg_effectiveness, etc.
     """
     results: list[Trajectory] = []
-    for i, seed in enumerate(seeds):
+    pbar = tqdm(seeds, desc="eval", unit="seed", leave=False)
+    n_succ = 0
+    for i, seed in enumerate(pbar):
         attacker = make_attacker(seed, tokenizer, policy)
         traj = run_conversation(seed, attacker, target, judge, max_turns=max_turns)
         results.append(traj)
+        n_succ += int(traj.attack_success)
+        pbar.set_postfix(asr=f"{n_succ / (i + 1):.2f}")
         if verbose:
-            print(
+            tqdm.write(
                 f"[eval {i + 1}/{len(seeds)}] "
                 f"success={traj.attack_success} eff={traj.effectiveness:.3f}"
             )

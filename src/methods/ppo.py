@@ -43,6 +43,7 @@ import random
 from typing import Any
 
 import torch
+from tqdm.auto import tqdm
 
 from ..judge import make_judge, JUDGE_MODEL
 from ..models import load_model
@@ -326,6 +327,7 @@ def run(config: dict, logger: ResultsLogger) -> dict:
     step             = 0
     last_running_asr = 0.0
 
+    pbar = tqdm(total=n_steps, desc="PPO", unit="step")
     while step < n_steps:
         # batch_q / batch_r / batch_rew: per-(q,r)-pair lists passed to PPO step.
         # batch_rew_per_convo: one reward per conversation, used for logging only.
@@ -395,6 +397,11 @@ def run(config: dict, logger: ResultsLogger) -> dict:
 
         log.info("  convo rewards=%s | running_ASR=%.3f",
                  [round(r, 3) for r in batch_rew_per_convo], last_running_asr)
+        pbar.update(len(batch_judg))
+        pbar.set_postfix(
+            asr=f"{last_running_asr:.2f}",
+            reward=f"{sum(batch_rew_per_convo) / len(batch_rew_per_convo):.2f}",
+        )
 
         if step % ckpt_every == 0:
             ckpt = logger.artifact_path("checkpoints", f"step_{step}")
@@ -406,6 +413,7 @@ def run(config: dict, logger: ResultsLogger) -> dict:
         gc.collect()
         torch.cuda.empty_cache()
 
+    pbar.close()
     log.info("PPO training complete. Final running ASR: %.3f", last_running_asr)
 
     final_ckpt = logger.artifact_path("checkpoints", "final")

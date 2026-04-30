@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 from .eval import evaluate_attacker
 from .logprobs import attacker_logprobs
@@ -82,8 +83,9 @@ def iterative_dpo_train(
 
     history: list[dict] = []
 
-    for outer in range(n_outer):
-        print(f"\n{'=' * 80}\nOuter iteration {outer + 1}/{n_outer}\n{'=' * 80}")
+    outer_pbar = tqdm(range(n_outer), desc="DPO outer", unit="iter")
+    for outer in outer_pbar:
+        tqdm.write(f"\n{'=' * 80}\nOuter iteration {outer + 1}/{n_outer}\n{'=' * 80}")
 
         # --- 1. Collect rollouts under the current policy ---
         policy.eval()
@@ -101,7 +103,7 @@ def iterative_dpo_train(
             )
 
         n_succ = sum(1 for t in trajectories if t.attack_success)
-        print(f"  collected {len(trajectories)} trajectories, {n_succ} successful")
+        tqdm.write(f"  collected {len(trajectories)} trajectories, {n_succ} successful")
 
         # Persist trajectories before training so analysis survives even if
         # the rest of the iteration crashes (or no pairs end up being built).
@@ -110,15 +112,15 @@ def iterative_dpo_train(
             os.makedirs(iter_dir, exist_ok=True)
             with open(os.path.join(iter_dir, "trajectories.pkl"), "wb") as f:
                 pickle.dump(trajectories, f)
-            print(f"  saved trajectories to {iter_dir}/trajectories.pkl")
+            tqdm.write(f"  saved trajectories to {iter_dir}/trajectories.pkl")
 
         # --- 2. Build preference pairs (caches ref log-probs) ---
         with torch.no_grad():
             pairs = build_pairs(trajectories, ref_logp_fn)
-        print(f"  built {len(pairs)} preference pairs")
+        tqdm.write(f"  built {len(pairs)} preference pairs")
 
         if not pairs:
-            print("  ⚠️ no pairs this iteration — skipping training")
+            tqdm.write("  ⚠️ no pairs this iteration — skipping training")
             history.append({"outer": outer, "n_trajectories": len(trajectories), "n_pairs": 0})
             continue
 
@@ -132,7 +134,13 @@ def iterative_dpo_train(
         for epoch in range(n_epochs):
             random.shuffle(pairs)
             optimizer.zero_grad(set_to_none=True)
-            for i, pair in enumerate(pairs):
+            inner_pbar = tqdm(
+                pairs,
+                desc=f"  iter {outer + 1} epoch {epoch + 1}/{n_epochs}",
+                unit="pair",
+                leave=False,
+            )
+            for i, pair in enumerate(inner_pbar):
                 loss, m = dpo_loss(policy, tokenizer, pair, beta=beta)
                 (loss / grad_accum).backward()
 
@@ -143,9 +151,11 @@ def iterative_dpo_train(
                 for k, v in m.items():
                     step_metrics[k].append(v)
 
+                inner_pbar.set_postfix(loss=f"{m['loss']:.3f}", acc=f"{m['accuracy']:.2f}")
+
             recent = step_metrics["loss"][-len(pairs):]
             recent_acc = step_metrics["accuracy"][-len(pairs):]
-            print(
+            tqdm.write(
                 f"  epoch {epoch + 1}/{n_epochs}: "
                 f"avg_loss={sum(recent) / len(recent):.4f} "
                 f"avg_acc={sum(recent_acc) / len(recent_acc):.2f}"
@@ -158,9 +168,14 @@ def iterative_dpo_train(
             target=target, judge=judge,
             seeds=eval_seeds, max_turns=max_turns, verbose=False,
         )
-        print(
+        tqdm.write(
             f"  eval ASR={eval_metrics['ASR']:.3f} "
             f"avg_eff={eval_metrics['avg_effectiveness']:.3f}"
+        )
+        outer_pbar.set_postfix(
+            ASR=f"{eval_metrics['ASR']:.2f}",
+            eff=f"{eval_metrics['avg_effectiveness']:.2f}",
+            pairs=len(pairs),
         )
 
         # --- 5. Checkpoint ---
@@ -168,7 +183,7 @@ def iterative_dpo_train(
             ckpt_path = os.path.join(checkpoint_dir, f"iter_{outer:03d}")
             os.makedirs(ckpt_path, exist_ok=True)
             policy.save_pretrained(ckpt_path)
-            print(f"  saved adapter to {ckpt_path}")
+            tqdm.write(f"  saved adapter to {ckpt_path}")
 
         history.append({
             "outer": outer,

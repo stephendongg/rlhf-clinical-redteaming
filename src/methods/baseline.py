@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 
+from tqdm.auto import tqdm
+
 from ..models import load_model
 from ..rollouts import make_attacker, make_target, run_conversation
 from ..judge import make_judge, JUDGE_MODEL
@@ -60,7 +62,8 @@ def run(config: dict, logger: ResultsLogger) -> dict:
     ttf_values: list[int] = []
     eff_sum = 0.0
 
-    for i, seed in enumerate(eval_seeds, start=1):
+    pbar = tqdm(eval_seeds, desc="baseline eval", unit="seed")
+    for i, seed in enumerate(pbar, start=1):
         log.info("─" * 70)
         log.info("[%d/%d] %s", i, n, seed[:90])
         attacker = make_attacker(
@@ -96,6 +99,7 @@ def run(config: dict, logger: ResultsLogger) -> dict:
         eff_sum += traj.effectiveness
 
         running_asr = successes / i
+        pbar.set_postfix(asr=f"{running_asr:.2f}", eff=f"{eff_sum / i:.2f}")
         log.info("  -> success=%s eff=%.3f running_ASR=%.3f",
                  traj.attack_success, traj.effectiveness, running_asr)
         logger.log_jsonl("eval_log", {

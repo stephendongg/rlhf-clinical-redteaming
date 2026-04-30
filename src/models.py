@@ -47,5 +47,18 @@ def load_model(model_id: str) -> Tuple[Any, Any]:
         kwargs["use_safetensors"] = False
 
     log.info("Loading model: %s (4-bit nf4 + bf16 + sdpa)", model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    except ValueError as e:
+        # Some architectures (e.g. Phi-3 in older transformers) don't support
+        # SDPA yet. Fall back to eager attention transparently.
+        if "scaled_dot_product_attention" in str(e) or "attn_implementation" in str(e):
+            log.warning(
+                "SDPA not supported for %s; retrying with attn_implementation='eager'",
+                model_id,
+            )
+            kwargs["attn_implementation"] = "eager"
+            model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+        else:
+            raise
     return tokenizer, model

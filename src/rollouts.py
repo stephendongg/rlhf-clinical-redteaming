@@ -28,6 +28,10 @@ TARGET_SYSTEM_PROMPT = (
 class Turn:
     attacker_prompt_messages: list[dict]
     # Stored to bypass text-tokenization round-trip drift at log-prob time.
+    # `attacker_prompt_ids` are the exact ids the attacker conditioned on at
+    # generation time — caching these lets attacker_logprobs skip the
+    # apply_chat_template + tokenizer round-trip on every gradient step.
+    attacker_prompt_ids: list[int]
     attacker_response_ids: list[int]
     attacker_response: str
     target_response: str
@@ -42,7 +46,7 @@ class Trajectory:
     effectiveness: float
 
 
-AttackerFn = Callable[[list[dict]], tuple[str, list[dict], list[int]]]
+AttackerFn = Callable[[list[dict]], tuple[str, list[dict], list[int], list[int]]]
 TargetFn = Callable[[list[dict]], str]
 JudgeFn = Callable[..., dict]
 
@@ -58,7 +62,7 @@ def make_attacker(
     # PeftModel does not expose a top-level .device attribute, so resolve via params.
     device = next(attacker_model.parameters()).device
 
-    def attacker(history: list[dict]) -> tuple[str, list[dict], list[int]]:
+    def attacker(history: list[dict]) -> tuple[str, list[dict], list[int], list[int]]:
         messages = [{"role": "system", "content": system}]
         for m in history:
             if m["role"] == "user":
@@ -70,6 +74,7 @@ def make_attacker(
             messages, tokenize=False, add_generation_prompt=True,
         )
         inputs = attacker_tokenizer(text, return_tensors="pt").to(device)
+        prompt_ids = inputs["input_ids"][0].tolist()
 
         with torch.no_grad():
             output = attacker_model.generate(
@@ -82,7 +87,7 @@ def make_attacker(
 
         generated_ids = output[0][inputs["input_ids"].shape[1]:].tolist()
         response = attacker_tokenizer.decode(generated_ids, skip_special_tokens=True)
-        return response, messages, generated_ids
+        return response, messages, prompt_ids, generated_ids
 
     return attacker
 
@@ -132,7 +137,7 @@ def run_conversation(
     turns: list[Turn] = []
 
     for _ in range(max_turns):
-        user_msg, prompt_messages, response_ids = attacker(history)
+        user_msg, prompt_messages, prompt_ids, response_ids = attacker(history)
         target_history = history + [{"role": "user", "content": user_msg}]
         assistant_msg = target(target_history)
 
@@ -143,6 +148,7 @@ def run_conversation(
 
         turns.append(Turn(
             attacker_prompt_messages=prompt_messages,
+            attacker_prompt_ids=prompt_ids,
             attacker_response_ids=response_ids,
             attacker_response=user_msg,
             target_response=assistant_msg,

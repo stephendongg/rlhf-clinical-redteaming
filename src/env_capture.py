@@ -20,7 +20,12 @@ def _git_sha() -> str:
 
 
 def _git_dirty() -> bool:
-    return bool(_run(["git", "status", "--porcelain"]))
+    """True iff there are uncommitted modifications to *tracked* files.
+
+    Untracked files (e.g. *.egg-info from `pip install -e .`, __pycache__,
+    .venv) are intentionally ignored — they don't change what code ran.
+    """
+    return bool(_run(["git", "status", "--porcelain", "--untracked-files=no"]))
 
 
 def _git_diff() -> str:

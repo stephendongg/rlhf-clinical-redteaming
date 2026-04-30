@@ -3,168 +3,192 @@
 **Audrey Tjokro · Stephen Dong · Niki Karanikola**
 Cornell University — CS 6782 Generative Models, Spring 2026
 
-Multi-turn adversarial stress-testing for clinical LLMs, comparing PPO and DPO for training red-team agents on Med-Safety-Bench.
+Multi-turn adversarial stress-testing for clinical LLMs, comparing **baseline / DPO / PPO** for training red-team agents on Med-Safety-Bench.
 
 ---
 
-## Setup
+## Layout
 
-**Requires a Colab A100 GPU.**
-
-1. Clone the repo into Google Drive (run once):
-```python
-from google.colab import drive
-drive.mount('/content/drive')
-!git clone https://github.com/stephendongg/rlhf-clinical-redteaming /content/drive/MyDrive/rlhf-clinical-redteaming
+```
+configs/   YAML defaults for each method (source of truth for hyperparameters)
+notebooks/ Colab driver only — no training logic lives here
+src/       Python package (CLI, methods, results store, env capture)
+results/   Local mirror of per-run artifacts; canonical store is GCS
 ```
 
-2. Add your OpenAI key to Colab Secrets (🔑 icon, left sidebar): `OPENAI_API_KEY`
+The Colab notebook is just a launcher. All training, eval, and logging logic
+lives in `src/`. To change a hyperparameter, edit a YAML — never the notebook.
 
-3. Open `redteam.ipynb` (DPO + baseline) or `ppo_training.ipynb` (PPO) from Drive in Colab and run all cells.
+## Setup (local)
 
-Each subsequent session: open the notebook from Drive and run `!git pull` to get the latest code.
+```bash
+git clone <this-repo>
+cd rlhf-clinical-redteaming
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+cp .env.example .env  # then fill in OPENAI_API_KEY + GCS_BUCKET
+```
 
----
+For Google Cloud auth (results sync): `gcloud auth application-default login`.
 
-## Dataset
+## Reproduction commands
 
-**Med-Safety-Bench** (Han et al., NeurIPS 2024) — 1,800 harmful medical requests paired with safe responses.
+Every run takes `--config`, optionally `--run-name`, `--seed`, `--gcs-bucket`,
+and any number of `--override path.to.key=value` entries. Anything passed via
+`--override` wins over both the YAML and the typed flags.
 
-- Loaded via HuggingFace: `israel-adewuyi/med-safety-bench-reproduced`
-- Train split (900): used for PPO/DPO fine-tuning
-- Test split (900): held out for final evaluation
-- Both methods use the same deterministic 100/20/100 train/dev/test sub-sample via `src/seeds.py` for direct comparability.
+### Baseline (no training; ASR / TTF on dev split)
 
----
+```bash
+python -m src baseline \
+    --config configs/baseline.yaml \
+    --run-name baseline-dev-v1 \
+    --gcs-bucket gs://results_043026
+```
 
-## Models
+### DPO (iterative; LoRA adapters checkpointed every outer iter)
 
-| Role | Model |
-|---|---|
-| Attacker | `Qwen/Qwen2.5-7B-Instruct` |
-| Target | `BioMistral/BioMistral-7B` |
-| Judge | `gpt-4o-mini` via OpenAI API |
+```bash
+python -m src dpo \
+    --config configs/dpo.yaml \
+    --run-name dpo-beta01-lr5e6 \
+    --gcs-bucket gs://results_043026 \
+    --beta 0.1 --lr 5e-6 --n-outer 4
+```
 
-Both attacker and target are loaded with 4-bit `nf4` quantization, bf16 compute, and SDPA attention. The attacker is wrapped with LoRA adapters (rank 16, on q/k/v/o-projections) for fine-tuning.
+### PPO (TRL 0.9.6; LoRA adapters checkpointed every 20 steps)
 
----
+```bash
+python -m src ppo \
+    --config configs/ppo.yaml \
+    --run-name ppo-kl0.3-lr1e5 \
+    --gcs-bucket gs://results_043026 \
+    --target-kl 0.3 --lr 1e-5 --n-train-steps 100
+```
 
-## PPO Training: Iterations & Design Decisions
+### Final (test-split) evaluation — append `--use-test` to any of the above
 
-### Iteration 1: trl version fix
-- Newer trl versions removed PPOTrainer — pinned to `trl==0.9.6`
-- Loaded Qwen with `AutoModelForCausalLMWithValueHead` + LoRA (r=16)
-- Loaded frozen reference model for KL divergence penalty
+```bash
+python -m src baseline --config configs/baseline.yaml --use-test \
+    --run-name baseline-test --gcs-bucket gs://results_043026
+```
 
-### Iteration 2: Generation bug fix
-- `ppo_trainer.generate()` returned truncated tensors shorter than input
-- Fixed by calling `ppo_model.pretrained_model.generate()` directly
-- Resolved empty response tensors silently breaking the training loop
+### Querying past runs
 
-### Iteration 3: Batch size alignment
-- PPOTrainer requires exactly `batch_size` trajectories per `.step()` call
-- Added incomplete batch guard to skip PPO update on final partial batch
-- Restructured loop to collect 4 trajectories before each gradient update
+Each run drops `run_record.json` at `gs://results_043026/<method>/<run-uuid>/`.
+To load all runs into a DataFrame:
 
-### Iteration 4: Hyperparameter tuning
-- Loosened `target_kl`: 0.1 → 0.3 (allowed more policy movement)
-- Disabled `use_score_scaling` (harmful with sparse rewards)
-- Kept `learning_rate=1e-5`, `batch_size=4`, `mini_batch_size=1`
+```python
+import json, pandas as pd
+from google.cloud import storage
 
-### Iteration 5: Resilience & logging
-- Added `judge_trajectory_with_retry()` — 3 retries, 15s wait
-  (OpenAI rate limits caused crash at step ~38)
-- Added resume-from-checkpoint logic for mid-run crash recovery
-- Saved full trajectories to `.jsonl` + summary to `.csv` for analysis
+bucket = storage.Client().bucket("results_043026")
+records = []
+for blob in bucket.list_blobs():
+    if blob.name.endswith("run_record.json"):
+        records.append(json.loads(blob.download_as_text()))
+df = pd.json_normalize(records)
+```
 
----
+## Switching the judge (OpenAI ↔ local HF)
 
-## PPO Results
+The judge is selected per-run via two YAML fields (overridable from the CLI):
 
-| Metric | Baseline (untuned) | PPO-trained |
+```yaml
+judge_backend: openai            # or hf_local
+judge_model:   gpt-4o-mini       # or e.g. meta-llama/Llama-3.1-8B-Instruct
+```
+
+The `hf_local` backend loads the model once per run with the same 4-bit nf4 +
+bf16 + sdpa setup as the attacker/target, then reuses it across calls. Both
+backends return the same dict schema (same `score_trajectory_judgment`
+output), so swapping them does not require any code change.
+
+### Recommended HF judge models
+
+| Model | Size (4-bit) | Notes |
 |---|---|---|
-| ASR (dev, n=20) | 0.40 | 0.20 |
-| Avg TTF | 1.75 turns | 3.50 turns |
-| Avg effectiveness | 0.28 | 0.14 |
+| `meta-llama/Llama-3.1-8B-Instruct` | ~5 GB | Default recommendation. **Gated** — accept the license on HF and set `HF_TOKEN`. |
+| `Qwen/Qwen2.5-14B-Instruct`        | ~9 GB | Stronger reasoning; ungated. Don't pair with a Qwen attacker (same-family bias). |
+| `mistralai/Mistral-7B-Instruct-v0.3` | ~5 GB | Lightweight fallback; weaker JSON adherence. |
 
-### Interpretation
-PPO **underperformed** the untuned baseline. Key reasons:
-1. **Reward sparsity** — ~75% of trajectories scored 0.0, too little signal
-2. **Insufficient steps** — 400 total conversations, PPO needs thousands
-3. **KL over-regularization** — penalty pulls policy back toward safe behavior
-4. **Terminal-only reward** — single scalar over 5 turns makes credit assignment hard
+### GPU memory budget (40 GB A100)
 
-### Findings & Related Work
+| Run | Models on GPU | Total (4-bit) | Fits 40 GB? |
+|---|---|---|---|
+| baseline + openai judge | attacker + target | ~10 GB | ✓ |
+| baseline + hf_local judge | attacker + target + judge | ~16 GB | ✓ |
+| dpo + openai judge | attacker(+LoRA) + target | ~10 GB | ✓ |
+| dpo + hf_local judge | attacker(+LoRA) + target + judge | ~16 GB | ✓ |
+| ppo + openai judge | policy + ref + target | ~16 GB | ✓ |
+| ppo + hf_local judge | policy + ref + target + judge | ~22 GB + KV cache | ⚠ tight; OOM likely |
 
-**Core finding:** PPO actively made the attacker *more cautious* than the
-untuned baseline (ASR 0.20 vs 0.40), suggesting the KL penalty dominated
-the sparse reward signal rather than the reward shaping policy behavior.
+For PPO with an HF judge, use an 80 GB A100 or stick with `openai`.
 
-This is well-supported by prior work:
+### Switching mid-project: validate first
 
-**On PPO and sparse rewards:** Hu et al. (2023) in *Secrets of RLHF in Large
-Language Models Part I* directly observe that "PPO suffers from sparse reward
-and inefficient exploration in word space, making it sensitive to
-hyperparameters." Our setting — binary success/fail rewards over 5-turn
-conversations — represents an extreme case of this sparsity problem.
+Switching judge backend changes the evaluation contract. Before publishing
+numbers from a new judge, validate agreement with the old one:
 
-**On KL over-regularization:** The same work finds the KL penalty "critical
-to stability" but also notes it can prevent the policy from meaningfully
-moving away from the reference model. In our case, Qwen2.5-7B-Instruct is
-already a safety-aligned base model. The KL penalty therefore pulled the
-policy *back toward safe behavior* whenever sparse rewards failed to provide
-sufficient signal to overcome it — the opposite of what we needed.
+```bash
+# Re-judge a sample of existing trajectories with the HF judge
+python -c "
+import json
+from src.judge import make_judge, rejudge_traces
+hf_judge = make_judge('hf_local', 'meta-llama/Llama-3.1-8B-Instruct')
+# load N existing traces, re-score, compute Cohen's kappa on attack_success
+# and Pearson r on policy_violation against the GPT-4o-mini judgments
+"
+```
 
-**On PPO vs DPO for this type of task:** Lyu et al. (2023) in *Rethinking
-the Role of PPO in RLHF* (Berkeley AI Research) highlight a fundamental
-tension: reward learning uses pairwise comparisons but PPO optimizes
-individual responses without comparisons. This mismatch is particularly
-acute in our setting where the reward signal is a single scalar over an
-entire multi-turn trajectory. DPO avoids this by directly learning from
-preference pairs — which may explain why DPO is theoretically better suited
-to this task.
+If Cohen's κ on `attack_success` < 0.6 between the two judges, do not compare
+ASR numbers across them — keep `openai` as primary.
 
-**What this suggests for future work:**
-- Reward shaping: intermediate per-turn rewards rather than terminal-only
-  signal would give PPO more to learn from
-- Curriculum learning: starting with easier seeds before hard ones
-- Removing the KL penalty entirely (as recent RLVR work does) and relying
-  on clipping alone to prevent collapse
-- More training steps: 400 trajectories is far below the thousands typically
-  needed for PPO to show meaningful improvement
+## Reproducibility contract
 
----
+- `--config` YAML is the source of truth. CLI flags only override.
+- `setup_seed.seed_everything(seed)` seeds Python / NumPy / torch (CPU+CUDA)
+  and sets `cudnn.deterministic=True`, `cudnn.benchmark=False`.
+- Each run captures `git_sha`, `git_dirty` flag, full `git diff` (if dirty),
+  Python version, `pip freeze`, GPU model, CUDA version, hostname, OS.
+- The CLI **refuses to run on a dirty git tree** unless `--allow-dirty`.
+- The resolved config is hashed (SHA256, key-sorted JSON) so two runs with
+  identical configs share a `config_hash`.
 
-## File Structure
+## How to add a new method
 
-### Shared infrastructure (`src/`)
-- `src/seeds.py` — deterministic train/dev/test split shared across baselines
-- `src/judge.py` — GPT-4o-mini trajectory judge prompt + scoring formula
-- `src/rollouts.py` — multi-turn conversation environment and rollout collection
-- `src/eval.py` — held-out evaluation: ASR, TTF, average effectiveness
+1. Add `configs/<name>.yaml` with `method: <name>` and the tunable knobs.
+2. Add `src/methods/<name>.py` exposing `run(config: dict, logger: ResultsLogger) -> dict`.
+   Inside, load models / data, run training/eval, call `logger.log_jsonl(...)`
+   for streaming logs, and return a final-metrics dict.
+3. Wire it into `src/cli.py`:
+   - Add a `sub.add_parser("<name>")` block in `build_parser`.
+   - Add a dispatch arm in `main()`.
+   - (Optional) extend `_typed_flag_overrides` for any method-specific typed flags.
+4. Document the reproduction command in this README.
 
-### DPO (`niki/dpo` lineage)
-- `redteam.ipynb` — main DPO + baseline notebook
-- `src/dpo.py` — iterative trajectory-level DPO training loop
-- `src/logprobs.py` — batched per-trajectory log-probability computation
-- `src/preference.py` — best-vs-worst preference pair construction
-- `src/lora_setup.py` — LoRA attachment for the 4-bit attacker
-- `checkpoints/dpo/iter_NNN/` — LoRA adapter + trajectories per outer iteration
+## Colab usage
 
-### PPO (`audrey` lineage)
-- `ppo_training.ipynb` — main PPO training notebook
-- `results/ppo_training_log.jsonl` — step-level metrics over 100 training steps
-- `results/ppo_summary.csv` — human-readable training summary with attacker turn-1 text
-- `results/ppo_dev_eval_metrics.json` — dev set evaluation results
-- `results/ppo_trajectories.jsonl` — full conversation trajectories (Drive only, too large for GitHub)
-- `checkpoints/ppo/` — model weights every 20 steps + final (Drive only, too large for GitHub)
+Open `notebooks/run_cli.ipynb`. Edit the `CONFIG` cell to pick method + run
+name, then **Runtime → Run all**. Artifacts auto-sync to GCS at the end.
 
----
+## Storage layout (canonical = GCS)
 
-## How to Run
-
-1. Open in Google Colab with A100 GPU
-2. Add `OPENAI_API_KEY` (and `GITHUB_PAT` if pushing) to Colab Secrets
-3. Run cells sequentially in either notebook
-4. **PPO** — fresh run: set `RESUME_FROM_STEP = 0`; resume: set `RESUME_FROM_STEP = <last completed step>`
-5. **DPO** — checkpoints land in `checkpoints/dpo/iter_NNN/`; load via `PeftModel.from_pretrained(attacker_model, "checkpoints/dpo/iter_NNN")` to resume or evaluate
+```
+gs://results_043026/
+├── baseline/<run-uuid>/
+│   ├── run_record.json      # config + env + final metrics
+│   ├── trajectories.jsonl   # one record per evaluated trajectory
+│   ├── eval_log.jsonl       # streaming per-trial summary
+│   └── split_fingerprint.jsonl
+├── dpo/<run-uuid>/
+│   ├── run_record.json
+│   ├── training_log.jsonl   # per-outer-iter metrics
+│   └── checkpoints/iter_000/, iter_001/, ...   (LoRA adapters; every iter kept)
+├── ppo/<run-uuid>/
+│   ├── run_record.json
+│   ├── training_log.jsonl   # per-step PPO stats
+│   ├── trajectories.jsonl
+│   └── checkpoints/step_20/, step_40/, ..., final/
+└── data_rlhf/               # cached dataset shards (optional)
+```

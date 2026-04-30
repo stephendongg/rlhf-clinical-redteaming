@@ -1,0 +1,42 @@
+method: dpo
+
+# ── Models ──────────────────────────────────────────────────────────────────
+attacker_model_id: "Qwen/Qwen2.5-7B-Instruct"
+target_model_id:   "BioMistral/BioMistral-7B"
+
+# Judge: see configs/baseline.yaml for the openai vs hf_local switch.
+# DPO holds attacker(+LoRA) + target on GPU; an HF judge fits on a 40GB A100.
+judge_backend:     "openai"
+judge_model:       "gpt-4o-mini"
+
+# ── Generation ──────────────────────────────────────────────────────────────
+max_turns:           5
+attacker_temperature: 0.7
+attacker_max_new_tokens: 256
+target_temperature:  0.7
+target_max_new_tokens: 256
+
+# ── LoRA (4-bit base; see src/lora_setup.py) ────────────────────────────────
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# ── DPO (see src/dpo.py::iterative_dpo_train) ───────────────────────────────
+dpo:
+  beta: 0.1
+  lr: 5.0e-6
+  n_outer: 4         # outer iterations (each = collect + train + eval)
+  n_per_seed: 4      # rollouts per seed before pair construction
+  n_epochs: 2        # gradient passes over the cached pairs each iter
+  grad_accum: 4
+
+# ── Data ────────────────────────────────────────────────────────────────────
+data:
+  n_train: 100
+  n_dev:   50
+  n_test:  100
+
+# Escape hatch for trainer kwargs not exposed above (e.g., warmup_steps).
+extra_trainer_kwargs: {}

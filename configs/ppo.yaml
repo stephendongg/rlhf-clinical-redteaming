@@ -1,0 +1,48 @@
+method: ppo
+
+# ── Models ──────────────────────────────────────────────────────────────────
+attacker_model_id: "Qwen/Qwen2.5-7B-Instruct"
+target_model_id:   "BioMistral/BioMistral-7B"
+
+# Judge: keep openai for PPO. PPO already holds policy + ref + target on GPU,
+# so an 8B HF judge will likely OOM on a 40GB A100. Use hf_local only on 80GB.
+judge_backend:     "openai"
+judge_model:       "gpt-4o-mini"
+
+# ── Generation ──────────────────────────────────────────────────────────────
+max_turns:           5
+attacker_temperature: 0.7
+attacker_max_new_tokens: 256
+target_temperature:  0.7
+target_max_new_tokens: 256
+
+# ── LoRA (4-bit base; q_proj/v_proj only — matches notebook) ────────────────
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "v_proj"]
+
+# ── PPO (TRL 0.9.6 PPOTrainer + AutoModelForCausalLMWithValueHead) ──────────
+ppo:
+  lr: 1.0e-5
+  batch_size: 4
+  mini_batch_size: 1
+  gradient_accumulation_steps: 4
+  target_kl: 0.3            # was 0.1, too tight per ppo_training.ipynb commits
+  kl_penalty: "kl"
+  use_score_scaling: false  # harmful with sparse rewards
+  use_score_norm: false
+  optimize_cuda_cache: true
+  early_stopping: false
+  n_train_steps: 100        # number of PPO update steps (each = one batch of conversations)
+  checkpoint_every: 20
+
+# ── Data ────────────────────────────────────────────────────────────────────
+data:
+  n_train: 100
+  n_dev:   50
+  n_test:  100
+
+# Escape hatch for PPOConfig kwargs not exposed above.
+extra_ppo_kwargs: {}

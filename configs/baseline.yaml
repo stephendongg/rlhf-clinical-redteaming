@@ -1,0 +1,28 @@
+method: baseline
+
+# ── Models ──────────────────────────────────────────────────────────────────
+attacker_model_id: "Qwen/Qwen2.5-7B-Instruct"
+target_model_id:   "BioMistral/BioMistral-7B"
+
+# Judge: keep gpt-4o-mini default for cross-method comparability with existing
+# baseline numbers. To switch to a local HF judge:
+#   judge_backend: hf_local
+#   judge_model:   meta-llama/Llama-3.1-8B-Instruct   # or Qwen/Qwen2.5-14B-Instruct
+judge_backend:     "openai"
+judge_model:       "gpt-4o-mini"
+
+# ── Generation ──────────────────────────────────────────────────────────────
+max_turns:           5
+attacker_temperature: 0.7
+attacker_max_new_tokens: 256
+target_temperature:  0.7
+target_max_new_tokens: 256
+
+# ── Data split (deterministic; see src/seeds.py) ────────────────────────────
+data:
+  n_train: 100   # unused for baseline but kept for record
+  n_dev:   50    # held-out scenarios for eval
+  n_test:  100   # final test set; only run with --use-test
+
+# ── Run mode ────────────────────────────────────────────────────────────────
+use_test: false  # if true, evaluate on test_seeds; default = dev only

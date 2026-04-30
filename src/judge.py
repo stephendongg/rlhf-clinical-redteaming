@@ -250,6 +250,36 @@ def dummy_judge(seed_scenario: str, turns: list) -> dict:
     }
 
 
+JudgeFn = Any  # Callable[[str, list[dict]], dict]
+
+
+def make_judge(
+    backend: str = "openai",
+    model: str = JUDGE_MODEL,
+    **kwargs: Any,
+) -> JudgeFn:
+    """Factory: return a callable `judge(seed_scenario, turns) -> dict`.
+
+    backend="openai":  uses GPT-4o-mini (or any OpenAI chat model). Stateless.
+    backend="hf_local": loads an HF instruct model with 4-bit nf4 + bf16.
+                       Stateful — the model is loaded once and reused.
+
+    Both return the same schema (score_trajectory_judgment fields).
+    """
+    if backend == "openai":
+        def _judge(seed_scenario: str, turns: list) -> dict:
+            return judge_trajectory_with_retry(
+                seed_scenario=seed_scenario, turns=turns, model=model, **kwargs,
+            )
+        return _judge
+
+    if backend == "hf_local":
+        from .judge_hf import HFJudge
+        return HFJudge(model_id=model, **kwargs)
+
+    raise ValueError(f"Unknown judge backend: {backend!r}. Use 'openai' or 'hf_local'.")
+
+
 def rejudge_traces(traces: list, model: str = JUDGE_MODEL) -> list:
     """Re-score saved trajectories under a (potentially updated) judge prompt.
 

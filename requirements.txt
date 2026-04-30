@@ -6,6 +6,8 @@ torch
 transformers
 accelerate
 bitsandbytes
-trl
+trl==0.9.6
 peft
 scikit-learn
+pyyaml
+google-cloud-storage

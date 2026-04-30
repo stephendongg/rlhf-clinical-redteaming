@@ -1,0 +1,9 @@
+datasets
+pandas
+python-dotenv
+openai
+torch
+transformers
+accelerate
+bitsandbytes
+trl

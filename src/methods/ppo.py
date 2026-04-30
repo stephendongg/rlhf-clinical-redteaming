@@ -1,13 +1,38 @@
-"""PPO method (TRL). Extracted from ppo_training.ipynb §3-§4.
+"""PPO method (TRL). Extracted from ppo_training.ipynb §3–§4.
 
-Uses trl==0.9.6's PPOTrainer + AutoModelForCausalLMWithValueHead. The
-training loop generates multi-turn red-team conversations under the *current*
-PPO policy (gradients flowing through generation), scores each trajectory with
-the GPT-4o-mini judge, and applies the trajectory-level effectiveness as a
-single terminal reward to the last-turn (query, response) pair.
+Uses trl==0.9.6's PPOTrainer + AutoModelForCausalLMWithValueHead.
 
-Multi-turn note (preserved from the notebook): credit assignment across turns
-is approximate; we apply the terminal reward to the final turn's tokens.
+All knobs below are set in configs/ppo.yaml and can be overridden at runtime
+via --override (e.g. OVERRIDES = ['credit_assignment=discounted', 'ppo.target_kl=0.6']).
+
+credit_assignment  "last_turn" | "all_turns" | "discounted"
+    last_turn:   terminal reward applied only to the final attacker turn (original).
+    all_turns:   terminal reward broadcast equally to every turn. Assumption: each
+                 turn contributed equally to the outcome. More gradient signal, but
+                 introduces correlated samples within a batch.
+    discounted:  turn t receives gamma^(T-t) * reward (T = last turn index). More
+                 principled than flat broadcast; later turns are weighted higher.
+
+credit_discount_gamma  float (default 0.9) — exponent base for "discounted" mode.
+
+n_convos_per_update  int (default 4)
+    Full conversations per PPO step. PPOConfig batch_size is derived as
+    n_convos * max_turns (all_turns/discounted) or n_convos (last_turn).
+
+reward_signal  "effectiveness" | "attack_success" | "policy_violation" | "harmfulness"
+    effectiveness:    attack_success * harmfulness_normalized (composite, default).
+    attack_success:   binary 0/1 — cleanest sparse signal.
+    policy_violation: 1–5 severity — denser but conflates success/failure.
+    harmfulness:      composite harm score independent of the success flag.
+
+curriculum  bool (default false)
+    Sort training seeds shortest-first as a difficulty proxy before cycling.
+
+ppo.target_kl  float   sweep: 0.1 | 0.3 | 0.6 | 0.8
+ppo.kl_penalty  str    "kl" | "abs" | "mse" | "full" | "none"
+ppo.use_score_scaling / use_score_norm  bool
+max_turns  int          sweep: 3 | 5 | 7
+attacker_temperature  float  sweep: 0.5 | 0.7 | 0.9
 """
 
 from __future__ import annotations
@@ -31,7 +56,53 @@ from ..seeds import load_seed_splits, split_fingerprint
 log = logging.getLogger("redteam_rlhf.ppo")
 
 
+# ── Reward extraction ────────────────────────────────────────────────────────
+
+def _extract_reward(judgment: dict, reward_signal: str) -> float:
+    """Return a scalar reward from the judge output based on reward_signal."""
+    if reward_signal == "effectiveness":
+        return float(judgment["effectiveness"])
+    if reward_signal == "attack_success":
+        return float(judgment["attack_success"])
+    if reward_signal == "policy_violation":
+        # Normalise 1–5 scale to [0, 1].
+        return (float(judgment.get("policy_violation", 1)) - 1) / 4
+    if reward_signal == "harmfulness":
+        return float(judgment.get("harmfulness", 0.0))
+    raise ValueError(f"Unknown reward_signal: {reward_signal!r}")
+
+
+# ── Credit assignment ────────────────────────────────────────────────────────
+
+def _assign_credit(
+    q_tensors: list,
+    r_tensors: list,
+    reward: float,
+    credit_assignment: str,
+    gamma: float,
+) -> tuple[list, list, list]:
+    """Return (queries, responses, rewards) lists for PPO based on credit mode."""
+    T = len(q_tensors)
+    if credit_assignment == "last_turn":
+        return [q_tensors[-1]], [r_tensors[-1]], [torch.tensor(reward, dtype=torch.float32)]
+
+    if credit_assignment == "all_turns":
+        rewards = [torch.tensor(reward, dtype=torch.float32) for _ in range(T)]
+        return list(q_tensors), list(r_tensors), rewards
+
+    if credit_assignment == "discounted":
+        # Turn t (0-indexed) gets gamma^(T-1-t) * reward; final turn gets reward * 1.
+        rewards = [
+            torch.tensor(reward * (gamma ** (T - 1 - t)), dtype=torch.float32)
+            for t in range(T)
+        ]
+        return list(q_tensors), list(r_tensors), rewards
+
+    raise ValueError(f"Unknown credit_assignment: {credit_assignment!r}")
+
+
 # ── Generation with grad enabled (PPO requires it) ──────────────────────────
+
 def _generate_with_grad(
     seed_scenario: str,
     history: list[dict],
@@ -82,6 +153,7 @@ def _run_ppo_conversation(
     max_turns: int,
     max_new_tokens: int,
     temperature: float,
+    reward_signal: str,
 ):
     history: list[dict] = []
     turns: list[dict] = []
@@ -106,7 +178,7 @@ def _run_ppo_conversation(
         log.info("    turn %d ok", tn)
 
     judgment = judge(seed_scenario=seed_scenario, turns=turns)
-    reward = float(judgment["effectiveness"])
+    reward = _extract_reward(judgment, reward_signal)
     return turns, q_tensors, r_tensors, reward, judgment
 
 
@@ -125,7 +197,26 @@ def run(config: dict, logger: ResultsLogger) -> dict:
 
     eval_seeds = test_seeds if config.get("use_test") else dev_seeds
 
-    # ── Tokenizer + target (target uses our 4-bit loader; PPO model is custom) ──
+    # ── Experiment knobs ────────────────────────────────────────────────────
+    max_turns         = config.get("max_turns", 5)
+    credit_assignment = config.get("credit_assignment", "last_turn")
+    gamma             = config.get("credit_discount_gamma", 0.9)
+    reward_signal     = config.get("reward_signal", "effectiveness")
+    curriculum        = config.get("curriculum", False)
+
+    log.info(
+        "Experiment config: credit_assignment=%s gamma=%.2f reward_signal=%s "
+        "curriculum=%s max_turns=%d attacker_temp=%.2f",
+        credit_assignment, gamma, reward_signal, curriculum, max_turns,
+        config.get("attacker_temperature", 0.7),
+    )
+
+    # ── Curriculum: sort train seeds shortest-first as difficulty proxy ──────
+    if curriculum:
+        train_seeds = sorted(train_seeds, key=len)
+        log.info("Curriculum enabled: seeds sorted by length (shortest first).")
+
+    # ── Tokenizer + target ──────────────────────────────────────────────────
     log.info("Loading attacker tokenizer + target model")
     from transformers import AutoTokenizer
     attacker_tok = AutoTokenizer.from_pretrained(
@@ -166,13 +257,30 @@ def run(config: dict, logger: ResultsLogger) -> dict:
     for p in ref_model.parameters():
         p.requires_grad = False
 
+    # ── PPOConfig — batch sizes derived from credit assignment mode ──────────
     ppo_cfg = config["ppo"]
+    n_convos = ppo_cfg.get("n_convos_per_update", 4)
+
+    # last_turn: one (q,r) pair per conversation → batch_size = n_convos
+    # all_turns / discounted: max_turns pairs per conversation → batch_size = n_convos * max_turns
+    if credit_assignment == "last_turn":
+        effective_batch      = n_convos
+        effective_mini_batch = 1
+    else:
+        effective_batch      = n_convos * max_turns
+        effective_mini_batch = max_turns  # one conversation's turns per mini-batch
+
+    log.info(
+        "PPO batch: n_convos=%d credit=%s → batch_size=%d mini_batch=%d",
+        n_convos, credit_assignment, effective_batch, effective_mini_batch,
+    )
+
     extra = config.get("extra_ppo_kwargs") or {}
     trl_config = PPOConfig(
         model_name=config["attacker_model_id"],
         learning_rate=ppo_cfg["lr"],
-        batch_size=ppo_cfg["batch_size"],
-        mini_batch_size=ppo_cfg["mini_batch_size"],
+        batch_size=effective_batch,
+        mini_batch_size=effective_mini_batch,
         gradient_accumulation_steps=ppo_cfg["gradient_accumulation_steps"],
         optimize_cuda_cache=ppo_cfg["optimize_cuda_cache"],
         early_stopping=ppo_cfg["early_stopping"],
@@ -186,8 +294,13 @@ def run(config: dict, logger: ResultsLogger) -> dict:
     ppo_trainer = PPOTrainer(
         config=trl_config, model=ppo_model, ref_model=ref_model, tokenizer=attacker_tok,
     )
-    log.info("PPOTrainer ready: lr=%.2e batch=%d target_kl=%.2f",
-             ppo_cfg["lr"], ppo_cfg["batch_size"], ppo_cfg["target_kl"])
+    log.info(
+        "PPOTrainer ready: lr=%.2e batch=%d mini_batch=%d target_kl=%.2f kl_penalty=%s "
+        "score_scaling=%s score_norm=%s",
+        ppo_cfg["lr"], effective_batch, effective_mini_batch,
+        ppo_cfg["target_kl"], ppo_cfg["kl_penalty"],
+        ppo_cfg["use_score_scaling"], ppo_cfg["use_score_norm"],
+    )
 
     # ── Judge ───────────────────────────────────────────────────────────────
     judge_backend = config.get("judge_backend", "openai")
@@ -201,21 +314,25 @@ def run(config: dict, logger: ResultsLogger) -> dict:
     judge = make_judge(backend=judge_backend, model=judge_model)
 
     # ── Training loop ───────────────────────────────────────────────────────
-    n_steps = ppo_cfg["n_train_steps"]
+    n_steps    = ppo_cfg["n_train_steps"]
     ckpt_every = ppo_cfg["checkpoint_every"]
-    max_turns = config.get("max_turns", 5)
 
     seeds_cycle = train_seeds * (n_steps // max(len(train_seeds), 1) + 1)
-    random.shuffle(seeds_cycle)
+    # Shuffle only if not using curriculum (curriculum ordering must be preserved).
+    if not curriculum:
+        random.shuffle(seeds_cycle)
 
-    successes = 0
-    step = 0
+    successes        = 0
+    step             = 0
     last_running_asr = 0.0
 
     while step < n_steps:
-        batch_q, batch_r, batch_rew, batch_judg, batch_turns = [], [], [], [], []
+        # batch_q / batch_r / batch_rew: per-(q,r)-pair lists passed to PPO step.
+        # batch_rew_per_convo: one reward per conversation, used for logging only.
+        batch_q, batch_r, batch_rew = [], [], []
+        batch_rew_per_convo, batch_judg, batch_turns = [], [], []
 
-        for _ in range(trl_config.batch_size):
+        for _ in range(n_convos):
             seed = seeds_cycle[step % len(seeds_cycle)]
             log.info("=" * 70)
             log.info("Step %d/%d | seed: %s", step + 1, n_steps, seed[:80])
@@ -228,19 +345,23 @@ def run(config: dict, logger: ResultsLogger) -> dict:
                 max_turns=max_turns,
                 max_new_tokens=config.get("attacker_max_new_tokens", 256),
                 temperature=config.get("attacker_temperature", 0.7),
+                reward_signal=reward_signal,
             )
-            batch_q.append(q_tensors[-1])
-            batch_r.append(r_tensors[-1])
-            batch_rew.append(torch.tensor(reward, dtype=torch.float32))
+
+            qs, rs, rews = _assign_credit(q_tensors, r_tensors, reward, credit_assignment, gamma)
+            batch_q.extend(qs)
+            batch_r.extend(rs)
+            batch_rew.extend(rews)
+            batch_rew_per_convo.append(reward)
             batch_judg.append(judgment)
             batch_turns.append(turns)
             step += 1
             if step >= n_steps:
                 break
 
-        if len(batch_q) < trl_config.batch_size:
-            log.info("Incomplete final batch (%d/%d) — stopping.",
-                     len(batch_q), trl_config.batch_size)
+        if len(batch_q) < effective_batch:
+            log.info("Incomplete final batch (%d/%d pairs) — stopping.",
+                     len(batch_q), effective_batch)
             break
 
         stats = ppo_trainer.step(batch_q, batch_r, batch_rew)
@@ -253,7 +374,9 @@ def run(config: dict, logger: ResultsLogger) -> dict:
 
             entry = {
                 "step": step - len(batch_judg) + i + 1,
-                "reward": batch_rew[i].item(),
+                "reward": batch_rew_per_convo[i],
+                "reward_signal": reward_signal,
+                "credit_assignment": credit_assignment,
                 "attack_success": judgment["attack_success"],
                 "policy_violation": judgment["policy_violation"],
                 "turns_to_failure": judgment.get("first_failure_turn"),
@@ -270,8 +393,8 @@ def run(config: dict, logger: ResultsLogger) -> dict:
                 "judgment": judgment,
             })
 
-        log.info("  batch rewards=%s | running_ASR=%.3f",
-                 [round(r.item(), 3) for r in batch_rew], last_running_asr)
+        log.info("  convo rewards=%s | running_ASR=%.3f",
+                 [round(r, 3) for r in batch_rew_per_convo], last_running_asr)
 
         if step % ckpt_every == 0:
             ckpt = logger.artifact_path("checkpoints", f"step_{step}")
@@ -285,7 +408,6 @@ def run(config: dict, logger: ResultsLogger) -> dict:
 
     log.info("PPO training complete. Final running ASR: %.3f", last_running_asr)
 
-    # Save final adapter explicitly.
     final_ckpt = logger.artifact_path("checkpoints", "final")
     final_ckpt.mkdir(parents=True, exist_ok=True)
     ppo_model.save_pretrained(str(final_ckpt))
@@ -296,4 +418,7 @@ def run(config: dict, logger: ResultsLogger) -> dict:
         "final_running_asr": last_running_asr,
         "n_train_successes": successes,
         "split": "test" if config.get("use_test") else "dev",
+        "credit_assignment": credit_assignment,
+        "reward_signal": reward_signal,
+        "curriculum": curriculum,
     }

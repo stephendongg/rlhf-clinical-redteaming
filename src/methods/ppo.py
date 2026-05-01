@@ -38,8 +38,11 @@ attacker_temperature  float  sweep: 0.5 | 0.7 | 0.9
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import random
+from collections import Counter
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -54,6 +57,149 @@ from ..rollouts import (
 from ..seeds import load_seed_splits, split_fingerprint
 
 log = logging.getLogger("redteam_rlhf.ppo")
+
+
+# ── Plots ────────────────────────────────────────────────────────────────────
+
+def _save_plots(run_dir: Path) -> None:
+    """Read training_log.jsonl + trajectories.jsonl and save PNG plots to run_dir."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log.warning("matplotlib not available — skipping plots")
+        return
+
+    training_log_path = run_dir / "training_log.jsonl"
+    trajectories_path = run_dir / "trajectories.jsonl"
+
+    if not training_log_path.exists():
+        log.warning("training_log.jsonl not found — skipping plots")
+        return
+
+    with training_log_path.open() as f:
+        training_log = [json.loads(l) for l in f if l.strip()]
+    trajectories = []
+    if trajectories_path.exists():
+        with trajectories_path.open() as f:
+            trajectories = [json.loads(l) for l in f if l.strip()]
+
+    if not training_log:
+        log.warning("training_log is empty — skipping plots")
+        return
+
+    steps   = [e["step"]        for e in training_log]
+    rewards = [e["reward"]      for e in training_log]
+    asrs    = [e["running_asr"] for e in training_log]
+
+    def _stat(key):
+        return [e.get("ppo_stats", {}).get(key, float("nan")) for e in training_log]
+
+    # ── Plot 1: Training curves ──────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle("PPO Training Curves", fontsize=14, fontweight="bold")
+
+    axes[0, 0].plot(steps, rewards, color="steelblue", alpha=0.8)
+    axes[0, 0].set(xlabel="Step", ylabel="Reward", title="Reward per Step")
+    axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(steps, asrs, color="darkorange")
+    axes[0, 1].set(xlabel="Step", ylabel="Running ASR", title="Running Attack Success Rate")
+    axes[0, 1].set_ylim(0, 1)
+    axes[0, 1].grid(True, alpha=0.3)
+
+    axes[1, 0].plot(steps, _stat("ppo/loss/policy"), color="green", alpha=0.8)
+    axes[1, 0].set(xlabel="Step", ylabel="Loss", title="PPO Policy Loss")
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].plot(steps, _stat("ppo/loss/value"), color="crimson", alpha=0.8)
+    axes[1, 1].set(xlabel="Step", ylabel="Loss", title="PPO Value Loss")
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fig.savefig(run_dir / "training_curves.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log.info("Saved: training_curves.png")
+
+    if not trajectories:
+        return
+
+    judgments = [t["judgment"] for t in trajectories if "judgment" in t]
+    if not judgments:
+        return
+
+    # ── Plot 2: Severity metrics ─────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle("Severity Metrics (LLM Judge)", fontsize=14, fontweight="bold")
+
+    int_bins = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
+
+    axes[0, 0].hist([j.get("policy_violation", 1) for j in judgments],
+                    bins=int_bins, color="crimson", edgecolor="black", alpha=0.7)
+    axes[0, 0].set(xlabel="Policy Violation (1=safe, 5=severe)", ylabel="Count",
+                   title="Policy Violation Distribution")
+    axes[0, 0].set_xticks([1, 2, 3, 4, 5])
+    axes[0, 0].grid(True, alpha=0.3, axis="y")
+
+    axes[0, 1].hist([j.get("convincingness", 1) for j in judgments],
+                    bins=int_bins, color="mediumorchid", edgecolor="black", alpha=0.7)
+    axes[0, 1].set(xlabel="Convincingness (1/3/5)", ylabel="Count",
+                   title="Attack Convincingness")
+    axes[0, 1].set_xticks([1, 2, 3, 4, 5])
+    axes[0, 1].grid(True, alpha=0.3, axis="y")
+
+    axes[1, 0].hist([j.get("specificity", 1) for j in judgments],
+                    bins=int_bins, color="steelblue", edgecolor="black", alpha=0.7)
+    axes[1, 0].set(xlabel="Specificity (1/3/5)", ylabel="Count",
+                   title="Attack Specificity")
+    axes[1, 0].set_xticks([1, 2, 3, 4, 5])
+    axes[1, 0].grid(True, alpha=0.3, axis="y")
+
+    axes[1, 1].hist([j.get("harmfulness", 0.0) for j in judgments],
+                    bins=10, range=(0, 1), color="darkorange", edgecolor="black", alpha=0.7)
+    axes[1, 1].set(xlabel="Harmfulness Score (0–1)", ylabel="Count",
+                   title="Harmfulness Distribution")
+    axes[1, 1].grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    fig.savefig(run_dir / "severity_metrics.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log.info("Saved: severity_metrics.png")
+
+    # ── Plot 3: AMA category breakdown (successful attacks only) ─────────────
+    successful = [j for j in judgments if j.get("attack_success")]
+    if successful:
+        cats = Counter(j.get("ama_category", "none") for j in successful)
+        cats.pop("none", None)
+        if cats:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            labels, counts = zip(*sorted(cats.items(), key=lambda x: x[1]))
+            bars = ax.barh(labels, counts, color="steelblue", edgecolor="black", alpha=0.8)
+            ax.bar_label(bars, padding=3)
+            ax.set(xlabel="Count", title="AMA Category Violations (Successful Attacks Only)")
+            plt.tight_layout()
+            fig.savefig(run_dir / "ama_categories.png", dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            log.info("Saved: ama_categories.png")
+
+    # ── Plot 4: TTF distribution ─────────────────────────────────────────────
+    ttf_values = [j.get("first_failure_turn") for j in judgments
+                  if j.get("first_failure_turn") is not None]
+    if ttf_values:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(ttf_values, bins=range(1, 8), align="left",
+                color="darkorange", edgecolor="black", alpha=0.8)
+        ax.set(xlabel="Turn Number", ylabel="Count",
+               title="Turns to First Safety Violation (TTF)")
+        ax.set_xticks(range(1, 7))
+        ax.grid(True, alpha=0.3, axis="y")
+        plt.tight_layout()
+        fig.savefig(run_dir / "ttf_distribution.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        log.info("Saved: ttf_distribution.png")
+
+    log.info("All plots saved to %s", run_dir)
 
 
 # ── Reward extraction ────────────────────────────────────────────────────────
@@ -407,6 +553,8 @@ def run(config: dict, logger: ResultsLogger) -> dict:
         torch.cuda.empty_cache()
 
     log.info("PPO training complete. Final running ASR: %.3f", last_running_asr)
+
+    _save_plots(logger.output_dir)
 
     final_ckpt = logger.artifact_path("checkpoints", "final")
     final_ckpt.mkdir(parents=True, exist_ok=True)

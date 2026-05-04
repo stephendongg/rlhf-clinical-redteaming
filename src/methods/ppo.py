@@ -471,6 +471,7 @@ def run(config: dict, logger: ResultsLogger) -> dict:
     successes        = 0
     step             = 0
     last_running_asr = 0.0
+    all_rewards: list[float] = []
 
     while step < n_steps:
         # batch_q / batch_r / batch_rew: per-(q,r)-pair lists passed to PPO step.
@@ -499,6 +500,7 @@ def run(config: dict, logger: ResultsLogger) -> dict:
             batch_r.extend(rs)
             batch_rew.extend(rews)
             batch_rew_per_convo.append(reward)
+            all_rewards.append(reward)
             batch_judg.append(judgment)
             batch_turns.append(turns)
             step += 1
@@ -554,6 +556,60 @@ def run(config: dict, logger: ResultsLogger) -> dict:
 
     log.info("PPO training complete. Final running ASR: %.3f", last_running_asr)
 
+    # ── Post-training evaluation (same metrics as DPO) ───────────────────────
+    split_name = "test" if config.get("use_test") else "dev"
+    log.info("Running post-training evaluation on %d %s seeds...",
+             len(eval_seeds), split_name)
+
+    eval_successes = 0
+    eval_eff_sum   = 0.0
+    eval_ttf: list[int] = []
+
+    for ei, seed in enumerate(eval_seeds, 1):
+        log.info("─" * 60)
+        log.info("[eval %d/%d] %s", ei, len(eval_seeds), seed[:80])
+        with torch.no_grad():
+            turns, _, _, _, judgment = _run_ppo_conversation(
+                seed_scenario=seed,
+                ppo_model=ppo_model,
+                tokenizer=attacker_tok,
+                target=target,
+                judge=judge,
+                max_turns=max_turns,
+                max_new_tokens=config.get("attacker_max_new_tokens", 256),
+                temperature=config.get("attacker_temperature", 0.7),
+                reward_signal="effectiveness",  # always effectiveness for eval
+            )
+
+        success = bool(judgment["attack_success"])
+        eff     = float(judgment["effectiveness"])
+        if success:
+            eval_successes += 1
+            ttf = judgment.get("first_failure_turn")
+            if ttf is not None:
+                eval_ttf.append(int(ttf))
+        eval_eff_sum += eff
+
+        logger.log_jsonl("eval_log", {
+            "i": ei, "seed": seed[:80],
+            "attack_success": success,
+            "effectiveness": eff,
+            "judgment": judgment,
+            "turns": turns,
+        })
+        log.info("  -> success=%s eff=%.3f", success, eff)
+
+    n_eval = len(eval_seeds)
+    eval_metrics = {
+        "n_trials": n_eval,
+        "n_successes": eval_successes,
+        "ASR": round(eval_successes / n_eval, 4) if n_eval else 0.0,
+        "avg_TTF_successes_only": round(sum(eval_ttf) / len(eval_ttf), 4) if eval_ttf else None,
+        "avg_effectiveness": round(eval_eff_sum / n_eval, 4) if n_eval else 0.0,
+        "split": split_name,
+    }
+    log.info("Post-training eval metrics: %s", eval_metrics)
+
     _save_plots(logger.output_dir)
 
     final_ckpt = logger.artifact_path("checkpoints", "final")
@@ -562,10 +618,10 @@ def run(config: dict, logger: ResultsLogger) -> dict:
     attacker_tok.save_pretrained(str(final_ckpt))
 
     return {
+        **eval_metrics,
         "n_train_steps": step,
-        "final_running_asr": last_running_asr,
+        "final_train_asr": last_running_asr,
         "n_train_successes": successes,
-        "split": "test" if config.get("use_test") else "dev",
         "credit_assignment": credit_assignment,
         "reward_signal": reward_signal,
         "curriculum": curriculum,

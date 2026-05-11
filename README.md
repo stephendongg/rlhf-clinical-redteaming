@@ -1,7 +1,7 @@
 # RLHF for Automated Clinical Red-Teaming
 
-**Audrey Tjokro · Stephen Dong · Niki Karanikola**
-Cornell University — CS 6782 Generative Models, Spring 2026
+**Audrey Tjokro · Stephen Dong · Niki Karanikola**  
+Cornell University — CS 5788 Generative Models, Spring 2026
 
 Multi-turn adversarial stress-testing for clinical LLMs, comparing **baseline / DPO / PPO** for training red-team agents on Med-Safety-Bench.
 

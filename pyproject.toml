@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlhf-clinical-redteaming"
+version = "0.1.0"
+description = "RLHF for automated clinical red-teaming (baseline / DPO / PPO)."
+requires-python = ">=3.10"
+readme = "README.md"
+authors = [
+    { name = "Audrey Tjokro" },
+    { name = "Stephen Dong" },
+    { name = "Niki Karanikola" },
+]
+# Loose pins per Colab default (project answer #10). Tighten for a paper rerun.
+dependencies = [
+    "datasets",
+    "pandas",
+    "python-dotenv",
+    "openai",
+    "torch",
+    "transformers",
+    "accelerate",
+    "bitsandbytes",
+    "trl==0.9.6",          # PPOTrainer API used by methods/ppo.py
+    "peft",
+    "scikit-learn",
+    "pyyaml",              # config loader
+    "google-cloud-storage" # GCS sync of per-run artifacts
+]
+
+[project.scripts]
+redteam-rlhf = "src.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

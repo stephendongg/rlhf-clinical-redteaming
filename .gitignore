@@ -5,3 +5,12 @@ __pycache__/
 *.pyc
 .DS_Store
 arena/
+
+# Python packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# iCloud Drive sync collisions
+* 2.*
+*\ 2

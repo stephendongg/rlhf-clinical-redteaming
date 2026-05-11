@@ -1,0 +1,74 @@
+method: ppo
+
+# ── Models ──────────────────────────────────────────────────────────────────
+attacker_model_id: "Qwen/Qwen2.5-7B-Instruct"
+target_model_id:   "BioMistral/BioMistral-7B"
+
+# Judge: keep openai for PPO. PPO already holds policy + ref + target on GPU,
+# so an 8B HF judge will likely OOM on a 40GB A100. Use hf_local only on 80GB.
+# judge_backend:     "openai"
+# judge_model:       "gpt-4o-mini"
+judge_backend: hf_local
+judge_model:   meta-llama/Llama-3.1-8B-Instruct
+
+# ── Generation ──────────────────────────────────────────────────────────────
+max_turns:            5     # sweep: 3 | 5 | 7
+attacker_temperature: 0.7   # sweep: 0.5 (focused) | 0.7 | 0.9 (exploratory)
+attacker_max_new_tokens: 256
+target_temperature:   0.7
+target_max_new_tokens: 256
+
+# ── LoRA (4-bit base; q_proj/v_proj only — matches notebook) ────────────────
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "v_proj"]
+
+# ── PPO (TRL 0.9.6 PPOTrainer + AutoModelForCausalLMWithValueHead) ──────────
+ppo:
+  lr: 1.0e-5
+  # batch_size and mini_batch_size are derived from n_convos_per_update,
+  # max_turns, and credit_assignment — do not set them here.
+  n_convos_per_update: 4          # conversations rolled out per PPO step
+  gradient_accumulation_steps: 4
+  target_kl: 0.3                  # sweep: 0.1 (tight) | 0.3 | 0.6 | 0.8 (loose)
+  kl_penalty: "kl"                # "kl" | "abs" | "mse" | "full" | "none"
+  use_score_scaling: false        # true: divide rewards by running std; helps when variance is high
+  use_score_norm: false           # true: zero-mean reward; helps when most rewards are near 0
+  optimize_cuda_cache: true
+  early_stopping: false
+  n_train_steps: 100
+  checkpoint_every: 20
+
+# ── Credit assignment ────────────────────────────────────────────────────────
+# Controls which (query, response) pairs receive the trajectory reward.
+#   last_turn:  only the final attacker turn (original behaviour).
+#   all_turns:  terminal reward broadcast equally to every turn.
+#               Assumption: each turn contributed equally to the outcome.
+#   discounted: turn t gets gamma^(T-t) * reward. More principled than
+#               flat broadcast; later turns are weighted higher.
+credit_assignment: "last_turn"   # sweep: "last_turn" | "all_turns" | "discounted"
+credit_discount_gamma: 0.9       # only used when credit_assignment = "discounted"
+
+# ── Reward signal ────────────────────────────────────────────────────────────
+# Which judge field to use as the scalar RL reward.
+#   effectiveness:    attack_success * harmfulness_normalized (composite, default)
+#   attack_success:   binary 0/1 — cleanest sparse signal
+#   policy_violation: 1–5 severity — denser but conflates success/failure
+#   harmfulness:      composite harm score independent of success flag
+reward_signal: "effectiveness"   # sweep: "effectiveness" | "attack_success" | "policy_violation" | "harmfulness"
+
+# ── Curriculum ───────────────────────────────────────────────────────────────
+# If true, training seeds are sorted shortest-first as a difficulty proxy,
+# exposing the model to simpler requests before harder multi-step scenarios.
+curriculum: false
+
+# ── Data ────────────────────────────────────────────────────────────────────
+data:
+  n_train: 100
+  n_dev:   50
+  n_test:  100
+
+# Escape hatch for PPOConfig kwargs not exposed above.
+extra_ppo_kwargs: {}
